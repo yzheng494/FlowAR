@@ -223,6 +223,65 @@ class Block_v1(nn.Module):
 
 
 
+class Block_time_only(nn.Module):
+    """
+    Self-attention + MLP block with AdaLN conditioned on timestep only.
+    No cross-attention, no condition embedding.
+    The `condition` argument in forward() is accepted but ignored so that all
+    call sites remain compatible with the standard flownet signature.
+    """
+    def __init__(
+            self,
+            dim: int,
+            num_heads: int,
+            mlp_ratio: float = 4.,
+            qkv_bias: bool = False,
+            qk_norm: bool = False,
+            proj_drop: float = 0.,
+            attn_drop: float = 0.,
+            drop_path: float = 0.,
+            act_layer: nn.Module = nn.GELU,
+            norm_layer: nn.Module = nn.LayerNorm,
+            mlp_layer: nn.Module = SwiGLU,
+    ) -> None:
+        super().__init__()
+        self.dim = dim
+        self.norm1 = RMSNorm(dim)
+        self.attn = Attention(
+            dim,
+            num_heads=num_heads,
+            qkv_bias=qkv_bias,
+            qk_norm=qk_norm,
+            attn_drop=attn_drop,
+            proj_drop=proj_drop,
+            norm_layer=norm_layer,
+        )
+        self.drop_path1 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        self.norm2 = RMSNorm(dim)
+        self.mlp = mlp_layer(
+            in_features=dim,
+            hidden_features=int(dim * mlp_ratio * 2 / 3.),
+            act_layer=act_layer,
+            drop=proj_drop,
+        )
+        self.drop_path2 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        # 6 scalars per position; t is [B, 1, dim] so output broadcasts over N
+        self.ada_lin = nn.Linear(dim, 6 * dim)
+
+    def forward(self, x: torch.Tensor, t, c, condition) -> torch.Tensor:
+        # t: [B, 1, dim]; view to [B, 1, 6, dim] then broadcast over sequence
+        gamma1, gamma2, scale1, scale2, shift1, shift2 = (
+            self.ada_lin(nn.SiLU()(t)).view(x.shape[0], 1, 6, self.dim).unbind(2)
+        )
+        x = x + self.drop_path1(
+            self.attn(self.norm1(x).mul(scale1.add(1)).add_(shift1)).mul_(gamma1)
+        )
+        x = x + self.drop_path2(
+            self.mlp(self.norm2(x).mul(scale2.add(1)).add_(shift2)).mul_(gamma2)
+        )
+        return x
+
+
 def modulate(x, shift, scale):
     return x * (1 + scale) + shift
 
@@ -363,3 +422,66 @@ class SimpleTransformerAdaLN(nn.Module):
             x = block(x, t, c, condition)
 
         return self.final_layer(x, c+t)
+
+
+class SimpleTransformerTimeOnly(nn.Module):
+    """
+    Flownet variant with no AR-context conditioning.
+
+    Identical to SimpleTransformerAdaLN except:
+      - No cond_embed (z_channels argument still accepted for API compatibility
+        with FlowAR, but no linear projection is created).
+      - Blocks use AdaLN conditioned on timestep only (Block_time_only).
+      - No cross-attention at any layer.
+      - forward(x, t, condition): `condition` is accepted but ignored, so all
+        call sites in FlowAR/sampler work without modification.
+    """
+
+    def __init__(
+        self,
+        in_channels,
+        model_channels,
+        out_channels,
+        z_channels,        # kept for API compatibility; not used internally
+        num_res_blocks,
+        cross=False,       # kept for API compatibility; always False internally
+    ):
+        super().__init__()
+        self.in_channels    = in_channels
+        self.model_channels = model_channels
+        self.out_channels   = out_channels
+        self.num_res_blocks = num_res_blocks
+
+        self.time_embed  = TimestepEmbedder(model_channels)
+        self.input_proj  = nn.Linear(in_channels, model_channels)
+
+        self.res_blocks = nn.ModuleList([
+            Block_time_only(model_channels, model_channels // 64)
+            for _ in range(num_res_blocks)
+        ])
+
+        self.final_layer = FinalLayer(model_channels, out_channels)
+        self.initialize_weights()
+
+    def initialize_weights(self):
+        def _basic_init(module):
+            if isinstance(module, nn.Linear):
+                torch.nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+        self.apply(_basic_init)
+        nn.init.normal_(self.time_embed.mlp[0].weight, std=0.02)
+        nn.init.normal_(self.time_embed.mlp[2].weight, std=0.02)
+        nn.init.constant_(self.final_layer.linear.weight, 0)
+        nn.init.constant_(self.final_layer.linear.bias, 0)
+
+    def forward(self, x, t, condition):
+        # `condition` is intentionally unused — this model is unconditional.
+        t = (t * 1000).long()
+        x = self.input_proj(x)
+        t = self.time_embed(t).unsqueeze(1)   # [B, 1, model_channels]
+
+        for block in self.res_blocks:
+            x = block(x, t, None, None)
+
+        return self.final_layer(x, t)         # FinalLayer broadcasts [B,1,dim] over N

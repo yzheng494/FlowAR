@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+.env
+
+# UV / pip
+uv.lock
+.python-version
+
+# Training outputs
+output_dir/
+logs/
+wandb/
+cache_dir/
+
+# Checkpoints and model weights
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# Data splits
+train/
+val/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+mar/

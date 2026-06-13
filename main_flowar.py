@@ -13,6 +13,12 @@ from torch.utils.tensorboard import SummaryWriter
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 
+try:
+    import wandb as _wandb
+    _WANDB_AVAILABLE = True
+except ImportError:
+    _WANDB_AVAILABLE = False
+
 from util.crop import center_crop_arr
 import util.misc as misc
 from util.misc import NativeScalerWithGradNormCount as NativeScaler
@@ -20,7 +26,7 @@ from util.loader import CachedFolder
 
 from models.vae import AutoencoderKL
 from models import flowar
-from engine import train_one_epoch, evaluate
+from engine import train_one_epoch, evaluate, evaluate_reconstruction
 import copy
 
 
@@ -115,6 +121,24 @@ def get_args_parser():
     parser.add_argument('--no_pin_mem', action='store_false', dest='pin_mem')
     parser.set_defaults(pin_mem=True)
     parser.add_argument('--use_checkpoint', action='store_true')
+    parser.add_argument('--use_sb', action='store_true',
+                        help='Use Schrödinger Bridge loss instead of flow matching')
+    parser.add_argument('--sb_mode', type=str, default='i2i', choices=['i2i', 'i2i_refine'],
+                        help='"i2i": Gaussian->x1 via sb_sampler, then x1->x2->... via I2I SB; '
+                             '"i2i_refine": x1 taken directly (no flownet at scale 0), '
+                             'then x1->x2->... via I2I SB')
+    parser.add_argument('--sb_prediction', type=str, default='x0', choices=['x0', 'v'],
+                        help='"x0": model predicts clean image directly; '
+                             '"v": model predicts velocity x1-x0 (recover x0 as x_t - t*v)')
+    parser.add_argument('--sb_no_condition', action='store_true',
+                        help='Use learned null embedding instead of AR context z in SB loss')
+    parser.add_argument('--sb_beta_max', type=float, default=1.0,
+                        help='Maximum beta for SB noise schedule')
+    parser.add_argument('--flownet_type', type=str, default='default',
+                        choices=['default', 'time_only'],
+                        help='"default": AdaLN on time+condition with optional cross-attention; '
+                             '"time_only": AdaLN on time only, no cross-attention, '
+                             'condition argument is ignored entirely')
     parser.set_defaults(use_checkpoint=False)
 
     # distributed training parameters
@@ -124,6 +148,19 @@ def get_args_parser():
     parser.add_argument('--dist_on_itp', action='store_true')
     parser.add_argument('--dist_url', default='env://',
                         help='url used to set up distributed training')
+
+    # wandb
+    parser.add_argument('--wandb', action='store_true',
+                        help='Enable Weights & Biases logging')
+    parser.add_argument('--wandb_project', default='flowar', type=str)
+    parser.add_argument('--wandb_entity',  default=None,      type=str)
+    parser.add_argument('--wandb_run_name', default=None,     type=str)
+
+    # val-set reconstruction metrics
+    parser.add_argument('--val_eval_freq', type=int, default=10,
+                        help='Epoch frequency for PSNR/SSIM/LPIPS val evaluation')
+    parser.add_argument('--val_eval_size', type=int, default=256,
+                        help='Number of val images used for reconstruction metrics')
 
     # caching latents
     parser.add_argument('--use_cached', action='store_true', dest='use_cached',
@@ -158,6 +195,19 @@ def main(args):
     else:
         log_writer = None
 
+    # wandb — only on rank 0
+    wandb_run = None
+    if args.wandb and _WANDB_AVAILABLE and global_rank == 0:
+        wandb_run = _wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=args.wandb_run_name,
+            config=vars(args),
+            resume='allow',
+        )
+    elif args.wandb and not _WANDB_AVAILABLE:
+        print("Warning: --wandb requested but wandb package not found. Skipping.")
+
     # augmentation following DiT and ADM
     transform_train = transforms.Compose([
         transforms.Resize(int(256*1.125)),
@@ -166,11 +216,21 @@ def main(args):
         transforms.ToTensor(),
         transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
     ])
+    transform_val = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(256),
+        transforms.ToTensor(),
+        transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
+    ])
+
     if args.evaluate:
         pass
     else:
 
-        dataset_train = datasets.ImageFolder(os.path.join(args.data_path, 'train'), transform=transform_train)
+        if args.use_cached:
+            dataset_train = CachedFolder(args.cached_path)
+        else:
+            dataset_train = datasets.ImageFolder(os.path.join(args.data_path, 'train'), transform=transform_train)
         print(dataset_train)
 
         sampler_train = torch.utils.data.DistributedSampler(
@@ -185,6 +245,29 @@ def main(args):
             pin_memory=args.pin_mem,
             drop_last=True,
         )
+
+    # held-out val loader for PSNR/SSIM/LPIPS — rank 0 only, fixed subset
+    val_loader_metrics = None
+    if global_rank == 0:
+        val_dir = os.path.join(args.data_path, 'val')
+        if os.path.isdir(val_dir):
+            dataset_val = datasets.ImageFolder(val_dir, transform=transform_val)
+            # fixed subset via a seeded random sampler
+            rng = torch.Generator()
+            rng.manual_seed(42)
+            indices = torch.randperm(len(dataset_val), generator=rng)[:args.val_eval_size].tolist()
+            subset_val = torch.utils.data.Subset(dataset_val, indices)
+            val_loader_metrics = torch.utils.data.DataLoader(
+                subset_val,
+                batch_size=min(16, args.val_eval_size),
+                shuffle=False,
+                num_workers=args.num_workers,
+                pin_memory=args.pin_mem,
+                drop_last=False,
+            )
+            print(f"Val metrics loader: {len(subset_val)} images from {val_dir}")
+        else:
+            print(f"Warning: val dir not found at {val_dir}, skipping reconstruction metrics.")
 
     vae = AutoencoderKL(embed_dim=args.vae_embed_dim, ch_mult=(1, 1, 2, 2, 4), ckpt_path=args.vae_path).cuda().eval()
     for param in vae.parameters():
@@ -202,7 +285,13 @@ def main(args):
         buffer_size=args.buffer_size,
         diffloss_d=args.diffloss_d,
         diffloss_w=args.diffloss_w,
-        use_checkpoint=args.use_checkpoint
+        use_checkpoint=args.use_checkpoint,
+        use_sb=args.use_sb,
+        sb_mode=args.sb_mode,
+        sb_prediction=args.sb_prediction,
+        sb_use_condition=not args.sb_no_condition,
+        sb_beta_max=args.sb_beta_max,
+        flownet_type=args.flownet_type,
     )
     
     print("Model = %s" % str(model))
@@ -265,6 +354,7 @@ def main(args):
             data_loader_train,
             optimizer, device, epoch, loss_scaler,
             log_writer=log_writer,
+            wandb_run=wandb_run,
             args=args
         )
 
@@ -285,6 +375,17 @@ def main(args):
             if not (args.cfg == 1.0 or args.cfg == 0.0):
                 evaluate(model, model_without_ddp, ema_params, args, epoch, batch_size=args.eval_bsz // 2,
                          log_writer=log_writer, cfg=args.cfg, use_ema=True)
+            torch.cuda.empty_cache()
+
+        # reconstruction metrics on held-out val set
+        if (val_loader_metrics is not None and
+                (epoch % args.val_eval_freq == 0 or epoch + 1 == args.epochs)):
+            torch.cuda.empty_cache()
+            evaluate_reconstruction(
+                model_without_ddp, vae, val_loader_metrics, args, epoch,
+                wandb_run=wandb_run,
+                num_samples=args.val_eval_size,
+            )
             torch.cuda.empty_cache()
 
         if misc.is_main_process():

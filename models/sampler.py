@@ -103,6 +103,73 @@ def euler_sampler(
     return x_next
 
 @torch.no_grad()
+def sb_sampler(
+        model,
+        x1,
+        condition,
+        num_steps=20,
+        cfg_scale=1.0,
+        guidance_low=0.0,
+        guidance_high=1.0,
+        beta_max=1.0,
+        prediction='x0',
+        ):
+    """
+    Image-to-Image Schrödinger Bridge sampler (Algorithm 2).
+
+    prediction='x0': model output is x0 directly.
+    prediction='v':  model output is v = x1 - x0; recover x0 as x_n - t_n * v_pred.
+    use_condition:   if False, zeros out the condition before every model call.
+
+    Posterior step (Brownian Bridge):
+      μ̃ = (1/n)·x0_pred + ((n-1)/n)·x_n
+      σ̃² = β_max · (n-1)/(n·N)
+    """
+    _dtype = x1.dtype
+    x_n = x1.to(torch.float64)
+    device = x_n.device
+
+    cond = condition
+
+    for n in range(num_steps, 0, -1):
+        t_n = n / num_steps
+
+        if cfg_scale > 1.0 and guidance_low <= t_n <= guidance_high:
+            model_input = torch.cat([x_n[:x_n.shape[0] // 2]] * 2, dim=0)
+        else:
+            model_input = x_n
+
+        time_input = torch.ones(model_input.shape[0], device=device, dtype=torch.float64) * t_n
+        raw_pred = model(
+            model_input.to(dtype=_dtype),
+            time_input.to(dtype=_dtype),
+            cond.to(dtype=_dtype),
+        ).to(torch.float64)
+
+        if cfg_scale > 1.0 and guidance_low <= t_n <= guidance_high:
+            pred_cond, pred_uncond = raw_pred.chunk(2, dim=0)
+            raw_pred_cfg = pred_uncond + cfg_scale * (pred_cond - pred_uncond)
+            raw_pred = torch.cat([raw_pred_cfg, raw_pred_cfg], dim=0)
+
+        # Recover x0 from model output
+        if prediction == 'x0':
+            x0_pred = raw_pred
+        else:  # 'v': v = x1 - x0  =>  x0 ≈ x_n - t_n * v
+            x0_pred = x_n - t_n * raw_pred
+
+        if n == 1:
+            x_n = x0_pred
+            break
+
+        # Brownian Bridge posterior step
+        mu_tilde    = (1.0 / n) * x0_pred + ((n - 1.0) / n) * x_n
+        sigma_tilde = (beta_max * (n - 1) / (n * num_steps)) ** 0.5
+        x_n = mu_tilde + sigma_tilde * torch.randn_like(x_n)
+
+    return x_n
+
+
+@torch.no_grad()
 def euler_maruyama_sampler(
         model,
         latents,
