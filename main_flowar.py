@@ -8,6 +8,9 @@ from pathlib import Path
 import torch
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
+# HPC compute nodes often lack the Unix sockets used by the default
+# "file_descriptor" sharing strategy; "file_system" uses plain files instead.
+torch.multiprocessing.set_sharing_strategy('file_system')
 import torch.backends.cudnn as cudnn
 from torch.utils.tensorboard import SummaryWriter
 import torchvision.transforms as transforms
@@ -22,7 +25,7 @@ except ImportError:
 from util.crop import center_crop_arr
 import util.misc as misc
 from util.misc import NativeScalerWithGradNormCount as NativeScaler
-from util.loader import CachedFolder
+from util.loader import CachedFolder, CachedEvalFolder
 
 from models.vae import AutoencoderKL
 from models import flowar
@@ -141,6 +144,16 @@ def get_args_parser():
                              'condition argument is ignored entirely')
     parser.set_defaults(use_checkpoint=False)
 
+    # Freeze AR transformer and fine-tune only the flownet
+    parser.add_argument('--freeze_ar', action='store_true',
+                        help='Freeze the AR transformer (encoder+decoder) and train only the '
+                             'flownet with SB loss. Requires --use_sb.')
+    parser.add_argument('--pretrained', default='', type=str,
+                        help='Directory containing checkpoint-last.pth of a pretrained FlowAR '
+                             'model. Used with --freeze_ar to initialise the AR weights before '
+                             'freezing them. Ignored when --resume already points to a valid '
+                             'checkpoint.')
+
     # distributed training parameters
     parser.add_argument('--world_size', default=1, type=int,
                         help='number of distributed processes')
@@ -167,6 +180,7 @@ def get_args_parser():
                         help='Use cached latents')
     parser.set_defaults(use_cached=False)
     parser.add_argument('--cached_path', default='', help='path to cached latents')
+    parser.add_argument('--val_cached_path', default='', help='path to cached latents for val eval; defaults to cached_path')
 
     return parser
 
@@ -249,10 +263,9 @@ def main(args):
     # held-out val loader for PSNR/SSIM/LPIPS — rank 0 only, fixed subset
     val_loader_metrics = None
     if global_rank == 0:
-        val_dir = os.path.join(args.data_path, 'val')
-        if os.path.isdir(val_dir):
-            dataset_val = datasets.ImageFolder(val_dir, transform=transform_val)
-            # fixed subset via a seeded random sampler
+        if args.use_cached:
+            cache_path = args.val_cached_path if args.val_cached_path else args.cached_path
+            dataset_val = CachedEvalFolder(cache_path)
             rng = torch.Generator()
             rng.manual_seed(42)
             indices = torch.randperm(len(dataset_val), generator=rng)[:args.val_eval_size].tolist()
@@ -265,9 +278,26 @@ def main(args):
                 pin_memory=args.pin_mem,
                 drop_last=False,
             )
-            print(f"Val metrics loader: {len(subset_val)} images from {val_dir}")
+            print(f"Val metrics loader (cached): {len(subset_val)} samples from {cache_path}")
         else:
-            print(f"Warning: val dir not found at {val_dir}, skipping reconstruction metrics.")
+            val_dir = os.path.join(args.data_path, 'val')
+            if os.path.isdir(val_dir):
+                dataset_val = datasets.ImageFolder(val_dir, transform=transform_val)
+                rng = torch.Generator()
+                rng.manual_seed(42)
+                indices = torch.randperm(len(dataset_val), generator=rng)[:args.val_eval_size].tolist()
+                subset_val = torch.utils.data.Subset(dataset_val, indices)
+                val_loader_metrics = torch.utils.data.DataLoader(
+                    subset_val,
+                    batch_size=min(16, args.val_eval_size),
+                    shuffle=False,
+                    num_workers=args.num_workers,
+                    pin_memory=args.pin_mem,
+                    drop_last=False,
+                )
+                print(f"Val metrics loader: {len(subset_val)} images from {val_dir}")
+            else:
+                print(f"Warning: val dir not found at {val_dir}, skipping reconstruction metrics.")
 
     vae = AutoencoderKL(embed_dim=args.vae_embed_dim, ch_mult=(1, 1, 2, 2, 4), ckpt_path=args.vae_path).cuda().eval()
     for param in vae.parameters():
@@ -302,6 +332,31 @@ def main(args):
     model.to(device)
     model_without_ddp = model
 
+    # ------------------------------------------------------------------
+    # Optional: freeze AR transformer, fine-tune flownet only with SB loss
+    # ------------------------------------------------------------------
+    if args.freeze_ar:
+        assert args.use_sb, "--freeze_ar requires --use_sb"
+        # Load pretrained AR weights unless we are already resuming a freeze_ar run
+        resuming = args.resume and os.path.exists(os.path.join(args.resume, "checkpoint-last.pth"))
+        if args.pretrained and not resuming:
+            ckpt_path = os.path.join(args.pretrained, 'checkpoint-last.pth')
+            checkpoint = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+            missing, unexpected = model_without_ddp.load_state_dict(checkpoint['model'], strict=False)
+            if missing:
+                print(f"[freeze_ar] missing keys (expected for new SB modules): {missing}")
+            if unexpected:
+                print(f"[freeze_ar] unexpected keys: {unexpected}")
+            del checkpoint
+            print(f"[freeze_ar] loaded pretrained weights from {ckpt_path}")
+        # Freeze everything except the flownet and (optional) sb_loss_fn null embedding
+        for name, param in model_without_ddp.named_parameters():
+            if not (name.startswith('flownet') or name.startswith('sb_loss_fn')):
+                param.requires_grad = False
+        n_frozen    = sum(p.numel() for p in model_without_ddp.parameters() if not p.requires_grad)
+        n_trainable = sum(p.numel() for p in model_without_ddp.parameters() if p.requires_grad)
+        print(f"[freeze_ar] {n_frozen/1e6:.1f}M params frozen  |  {n_trainable/1e6:.1f}M trainable")
+
     eff_batch_size = args.batch_size * misc.get_world_size()
 
     if args.lr is None:  # only base_lr is specified
@@ -323,7 +378,7 @@ def main(args):
 
     # resume training
     if args.resume and os.path.exists(os.path.join(args.resume, "checkpoint-last.pth")):
-        checkpoint = torch.load(os.path.join(args.resume, "checkpoint-last.pth"), map_location='cpu')
+        checkpoint = torch.load(os.path.join(args.resume, "checkpoint-last.pth"), map_location='cpu', weights_only=False)
         model_without_ddp.load_state_dict(checkpoint['model'])
         model_params = list(model_without_ddp.parameters())
         ema_state_dict = checkpoint['model_ema']
@@ -370,10 +425,10 @@ def main(args):
         # online evaluation
         if args.online_eval and (epoch % args.eval_freq == 0 or epoch + 1 == args.epochs):
             torch.cuda.empty_cache()
-            evaluate(model, model_without_ddp, ema_params, args, epoch, batch_size=args.eval_bsz, log_writer=log_writer,
+            evaluate(model_without_ddp, vae, args, epoch, batch_size=args.eval_bsz, log_writer=log_writer,
                      cfg=1.0, use_ema=True)
             if not (args.cfg == 1.0 or args.cfg == 0.0):
-                evaluate(model, model_without_ddp, ema_params, args, epoch, batch_size=args.eval_bsz // 2,
+                evaluate(model_without_ddp, vae, args, epoch, batch_size=args.eval_bsz // 2,
                          log_writer=log_writer, cfg=args.cfg, use_ema=True)
             torch.cuda.empty_cache()
 
@@ -385,6 +440,7 @@ def main(args):
                 model_without_ddp, vae, val_loader_metrics, args, epoch,
                 wandb_run=wandb_run,
                 num_samples=args.val_eval_size,
+                use_cached=args.use_cached,
             )
             torch.cuda.empty_cache()
 

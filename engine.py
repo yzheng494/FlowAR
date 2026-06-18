@@ -166,7 +166,7 @@ def evaluate(model_without_ddp, vae, args, epoch, batch_size=16, log_writer=None
              use_ema=True):
     model_without_ddp.eval()
     num_steps = args.num_images // (batch_size * misc.get_world_size()) + 1
-    save_folder = os.path.join(args.output_dir, "ariter{}cfg{}-image{}".format(args.num_steps, cfg, args.num_images))
+    save_folder = os.path.join(args.output_dir, "ariter{}cfg{}-image{}".format(args.num_step, cfg, args.num_images))
     if args.evaluate:
         save_folder = save_folder + "_evaluate"
     print("Save to:", save_folder)
@@ -198,7 +198,7 @@ def evaluate(model_without_ddp, vae, args, epoch, batch_size=16, log_writer=None
         # generation
         with torch.no_grad():
             with torch.cuda.amp.autocast():
-                sampled_tokens = model_without_ddp.sample_tokens(num_steps=args.num_steps, guidance=args.guidance, cfg=cfg,labels=labels_gen,)
+                sampled_tokens = model_without_ddp.sample_tokens(num_steps=args.num_step, guidance=args.guidance, cfg=cfg,labels=labels_gen,)
             with torch.cuda.amp.autocast():
                 sampled_images = vae.decode(sampled_tokens / 0.2325)
 
@@ -273,7 +273,8 @@ def _decode_scale_tokens(tokens, full_h, full_w, vae, scale_hw):
 
 @torch.no_grad()
 def evaluate_reconstruction(model_without_ddp, vae, val_loader, args, epoch,
-                             wandb_run=None, num_samples=256, nrow_vis=8):
+                             wandb_run=None, num_samples=256, nrow_vis=8,
+                             use_cached=False):
     """
     Two complementary reconstruction evaluations:
 
@@ -318,9 +319,12 @@ def evaluate_reconstruction(model_without_ddp, vae, val_loader, args, epoch,
         samples = samples.cuda()
         labels  = labels.cuda()
 
-        with torch.cuda.amp.autocast():
-            posterior = vae.encode(samples)
-        gt_latent = posterior.sample().mul_(0.2325)   # [B, C, H_lat, W_lat]
+        if use_cached:
+            gt_latent = DiagonalGaussianDistribution(samples.float()).mode().mul_(0.2325)
+        else:
+            with torch.cuda.amp.autocast():
+                posterior = vae.encode(samples)
+            gt_latent = posterior.sample().mul_(0.2325)   # [B, C, H_lat, W_lat]
         B, C, H_lat, W_lat = gt_latent.shape
 
         with torch.cuda.amp.autocast():

@@ -35,6 +35,7 @@ class CachedFolder(datasets.DatasetFolder):
             root,
             loader=None,
             extensions=(".npz",),
+            allow_empty=True,
         )
 
     def __getitem__(self, index: int):
@@ -47,10 +48,27 @@ class CachedFolder(datasets.DatasetFolder):
         """
         path, target = self.samples[index]
 
-        data = np.load(path)
-        if torch.rand(1) < 0.5:  # randomly hflip
-            moments = data['moments']
-        else:
-            moments = data['moments_flip']
+        with np.load(path) as data:
+            if torch.rand(1) < 0.5:  # randomly hflip
+                moments = data['moments'].copy()
+            else:
+                moments = data['moments_flip'].copy()
 
+        return moments, target
+
+
+class CachedEvalFolder(datasets.DatasetFolder):
+    """Like CachedFolder but no random flip — deterministic for evaluation."""
+    def __init__(self, root: str):
+        super().__init__(
+            root,
+            loader=None,
+            extensions=(".npz",),
+            allow_empty=True,
+        )
+
+    def __getitem__(self, index: int):
+        path, target = self.samples[index]
+        with np.load(path) as data:
+            moments = data['moments'].copy()
         return moments, target
