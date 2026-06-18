@@ -340,9 +340,15 @@ def main(args):
         # Load pretrained AR weights unless we are already resuming a freeze_ar run
         resuming = args.resume and os.path.exists(os.path.join(args.resume, "checkpoint-last.pth"))
         if args.pretrained and not resuming:
-            ckpt_path = os.path.join(args.pretrained, 'checkpoint-last.pth')
+            # Accept a direct .pth file or a directory containing checkpoint-last.pth
+            if args.pretrained.endswith('.pth'):
+                ckpt_path = args.pretrained
+            else:
+                ckpt_path = os.path.join(args.pretrained, 'checkpoint-last.pth')
             checkpoint = torch.load(ckpt_path, map_location='cpu', weights_only=False)
-            missing, unexpected = model_without_ddp.load_state_dict(checkpoint['model'], strict=False)
+            # Handle wrapped {'model': state_dict} and flat state_dict formats
+            state_dict = checkpoint['model'] if (isinstance(checkpoint, dict) and 'model' in checkpoint) else checkpoint
+            missing, unexpected = model_without_ddp.load_state_dict(state_dict, strict=False)
             if missing:
                 print(f"[freeze_ar] missing keys (expected for new SB modules): {missing}")
             if unexpected:
