@@ -162,7 +162,7 @@ def train_one_epoch(model, vae,
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
 
-def evaluate(model_without_ddp, vae, args, epoch, batch_size=16, log_writer=None, cfg=1.0,
+def evaluate(model, model_without_ddp, ema_params, vae, args, epoch, batch_size=16, log_writer=None, cfg=1.0,
              use_ema=True):
     model_without_ddp.eval()
     num_steps = args.num_images // (batch_size * misc.get_world_size()) + 1
