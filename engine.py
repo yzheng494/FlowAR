@@ -252,6 +252,23 @@ def evaluate(model_without_ddp, vae, args, epoch, batch_size=16, log_writer=None
         log_writer.add_scalar('fid{}'.format(postfix), fid, epoch)
         log_writer.add_scalar('is{}'.format(postfix), inception_score, epoch)
         print("FID: {:.4f}, Inception Score: {:.4f}".format(fid, inception_score))
+
+        # persist to the output directory so results survive without tensorboard/wandb
+        import json
+        fid_metrics = {
+            'fid{}'.format(postfix): fid,
+            'is{}'.format(postfix): inception_score,
+            'epoch': epoch,
+            'num_images': args.num_images,
+            'num_step': args.num_step,
+            'cfg': cfg,
+            'guidance': args.guidance,
+        }
+        fid_metrics_path = os.path.join(args.output_dir, 'fid_is_metrics.json')
+        with open(fid_metrics_path, 'w') as f:
+            json.dump(fid_metrics, f, indent=2, sort_keys=True)
+        print(f"Saved FID/IS metrics to {fid_metrics_path}")
+
         # remove temporal saving folder
         shutil.rmtree(save_folder)
 
@@ -303,10 +320,14 @@ def evaluate_reconstruction(model_without_ddp, vae, val_loader, args, epoch,
     if _LPIPS_AVAILABLE:
         lpips_fn = _lpips_lib.LPIPS(net='alex').cuda().eval()
 
-    # Accumulators — Option A: one list per scale; Option B: single list
+    # Accumulators — Option A: one list per scale; Option B: single list +
+    # per-scale lists for the actual (non-teacher-forced) generation trajectory
     psnr_A = {s: [] for s in scales}
     ssim_A = {s: [] for s in scales}
     psnr_B, ssim_B, lpips_B = [], [], []
+    psnr_B_scale  = {s: [] for s in scales}
+    ssim_B_scale  = {s: [] for s in scales}
+    lpips_B_scale = {s: [] for s in scales}
 
     # Visuals: coarse_ref | A_finest | B_e2e | ground_truth
     vis_rows = {'coarse': [], 'A': [], 'B': [], 'gt': []}
@@ -342,7 +363,7 @@ def evaluate_reconstruction(model_without_ddp, vae, val_loader, args, epoch,
             ssim_A[s].append(_ssim_batch(img_01, gt_01))
 
         # ── Option B: end-to-end from GT coarsest scale ────────────────────
-        b_tokens = model_without_ddp.sample_from_gt_coarse(
+        b_tokens, b_per_scale = model_without_ddp.sample_from_gt_coarse(
             gt_latent, labels, num_steps=args.num_step,
         )
         with torch.cuda.amp.autocast():
@@ -356,6 +377,17 @@ def evaluate_reconstruction(model_without_ddp, vae, val_loader, args, epoch,
             lp = lpips_fn(b_01.cuda() * 2 - 1,
                           gt_01.cuda() * 2 - 1).mean().item()
             lpips_B.append(lp)
+
+        # Per-scale metrics along the actual (non-teacher-forced) generation
+        # trajectory — used to measure improvement from one scale to the next.
+        for s, tok in zip(scales, b_per_scale):
+            img_01 = _decode_scale_tokens(tok.cuda(), H_lat, W_lat, vae, s).cpu()
+            psnr_B_scale[s].append(_psnr_batch(img_01, gt_01))
+            ssim_B_scale[s].append(_ssim_batch(img_01, gt_01))
+            if lpips_fn is not None:
+                lp_s = lpips_fn(img_01.cuda() * 2 - 1,
+                                gt_01.cuda() * 2 - 1).mean().item()
+                lpips_B_scale[s].append(lp_s)
 
         # Collect first batch for visualisation
         if not vis_rows['gt']:
@@ -387,6 +419,28 @@ def evaluate_reconstruction(model_without_ddp, vae, val_loader, args, epoch,
     if lpips_B:
         metrics['val/lpips_B'] = float(np.mean(lpips_B))
 
+    # Option B per-scale metrics (actual, non-teacher-forced generation
+    # trajectory), plus the improvement going from each scale to the next.
+    # PSNR/SSIM: higher is better, so improvement = value_next - value_prev.
+    # LPIPS:     lower is better,  so improvement = value_prev - value_next.
+    prev_s = None
+    for s in scales:
+        if not psnr_B_scale[s]:
+            continue
+        metrics[f'val/psnr_B_s{s}'] = float(np.mean(psnr_B_scale[s]))
+        metrics[f'val/ssim_B_s{s}'] = float(np.mean(ssim_B_scale[s]))
+        if lpips_B_scale[s]:
+            metrics[f'val/lpips_B_s{s}'] = float(np.mean(lpips_B_scale[s]))
+        if prev_s is not None:
+            metrics[f'val/psnr_B_improve_s{prev_s}_to_s{s}'] = (
+                metrics[f'val/psnr_B_s{s}'] - metrics[f'val/psnr_B_s{prev_s}'])
+            metrics[f'val/ssim_B_improve_s{prev_s}_to_s{s}'] = (
+                metrics[f'val/ssim_B_s{s}'] - metrics[f'val/ssim_B_s{prev_s}'])
+            if f'val/lpips_B_s{s}' in metrics and f'val/lpips_B_s{prev_s}' in metrics:
+                metrics[f'val/lpips_B_improve_s{prev_s}_to_s{s}'] = (
+                    metrics[f'val/lpips_B_s{prev_s}'] - metrics[f'val/lpips_B_s{s}'])
+        prev_s = s
+
     print("Val metrics —")
     print("  Option A (teacher-forced per-scale):")
     for s in scales:
@@ -398,6 +452,32 @@ def evaluate_reconstruction(model_without_ddp, vae, val_loader, args, epoch,
           f"PSNR={metrics['val/psnr_B']:.3f}  "
           f"SSIM={metrics['val/ssim_B']:.4f}"
           + (f"  LPIPS={metrics['val/lpips_B']:.4f}" if lpips_B else ""))
+    print("  Option B per-scale (generated vs ground truth) + scale-to-scale improvement:")
+    prev_s = None
+    for s in scales:
+        if f'val/psnr_B_s{s}' not in metrics:
+            continue
+        line = (f"    scale {s:2d}: PSNR={metrics[f'val/psnr_B_s{s}']:.3f}  "
+                f"SSIM={metrics[f'val/ssim_B_s{s}']:.4f}")
+        if f'val/lpips_B_s{s}' in metrics:
+            line += f"  LPIPS={metrics[f'val/lpips_B_s{s}']:.4f}"
+        if prev_s is not None:
+            line += (f"   |  Δ vs scale {prev_s}: "
+                      f"PSNR={metrics[f'val/psnr_B_improve_s{prev_s}_to_s{s}']:+.3f}  "
+                      f"SSIM={metrics[f'val/ssim_B_improve_s{prev_s}_to_s{s}']:+.4f}")
+            if f'val/lpips_B_improve_s{prev_s}_to_s{s}' in metrics:
+                line += f"  LPIPS={metrics[f'val/lpips_B_improve_s{prev_s}_to_s{s}']:+.4f}"
+        print(line)
+        prev_s = s
+
+    # ── Persist metrics to the output directory ─────────────────────────────
+    if getattr(args, 'output_dir', None):
+        import json
+        metrics_path = os.path.join(args.output_dir, 'reconstruction_metrics.json')
+        os.makedirs(args.output_dir, exist_ok=True)
+        with open(metrics_path, 'w') as f:
+            json.dump(metrics, f, indent=2, sort_keys=True)
+        print(f"Saved reconstruction metrics to {metrics_path}")
 
     if wandb_run is not None and _WANDB_AVAILABLE:
         log_dict = {**metrics, 'epoch': epoch}

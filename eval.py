@@ -183,8 +183,9 @@ def main(args):
     model.to(device)
     model_without_ddp = model
 
-    checkpoint = torch.load(os.path.join(args.resume), map_location='cpu')
-    model_without_ddp.load_state_dict(checkpoint)
+    checkpoint = torch.load(os.path.join(args.resume), map_location='cpu', weights_only=False)
+    state_dict = checkpoint['model'] if (isinstance(checkpoint, dict) and 'model' in checkpoint) else checkpoint
+    model_without_ddp.load_state_dict(state_dict)
     print("Resume checkpoint %s" % args.resume)
 
     torch.cuda.empty_cache()

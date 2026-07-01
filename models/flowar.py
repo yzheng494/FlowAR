@@ -622,6 +622,11 @@ class FlowAR(nn.Module):
 
         Because the coarsest scale pins the content to the source image, comparing
         the final output to the GT gives a meaningful PSNR/SSIM.
+
+        Returns:
+            final_img : unpatchified finest-scale output  [B, C, H, W]
+            per_scale : list of generated token tensors    [B, scale_k², 16],
+                        one per entry in self.scale, in coarse→fine order
         """
         B, C, H, W = latent.shape
 
@@ -650,6 +655,7 @@ class FlowAR(nn.Module):
 
         x = class_embedding.unsqueeze(1)
         prev_scale_latent = None
+        per_scale = []
 
         for step in range(len(self.scale)):
             start = starts[step]
@@ -688,6 +694,8 @@ class FlowAR(nn.Module):
                 ).float()
                 z_sample = sampled if cfg == 1.0 else sampled.chunk(2)[0]
 
+            per_scale.append(z_sample.detach().float())
+
             if step == len(self.scale) - 1:
                 break
 
@@ -703,7 +711,7 @@ class FlowAR(nn.Module):
             prev_scale_latent = x_.clone()
             x = self.z_proj(x_)
 
-        return self.unpatchify(z_sample)
+        return self.unpatchify(z_sample), per_scale
 
 
 def flowar_small(**kwargs):
