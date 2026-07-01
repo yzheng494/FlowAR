@@ -24,7 +24,7 @@ mkdir -p "$LOCALSCRATCH"
 
 echo "Staging data to localscratch..."
 rsync -a --progress /storage/scratch1/7/yzheng494/FlowAR/mar/vae "$LOCALSCRATCH/mar/"
-rsync -a --progress /storage/scratch1/7/yzheng494/FlowAR/cache_dir "$LOCALSCRATCH/"
+rsync -a --progress /storage/project/r-bdai6-0/yzheng494/FlowAR/cache_dir "$LOCALSCRATCH/"
 # Add any additional dataset directories below if needed:
 # rsync -a /path/to/dataset "$LOCALSCRATCH/"
 

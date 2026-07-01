@@ -19,6 +19,7 @@ echo "Node: $SLURMD_NODENAME"
 echo "Start: $(date)"
 
 WORKDIR=/storage/scratch1/7/yzheng494/FlowAR
+CACHE_DIR=/storage/project/r-bdai6-0/yzheng494/FlowAR/cache_dir
 LOG_DIR=/storage/home/hcoda1/7/yzheng494/logs
 mkdir -p "$LOG_DIR"
 LOG_FILE="$LOG_DIR/train_i2i_small_x1_pred_${SLURM_JOB_ID}.log"
@@ -46,7 +47,7 @@ uv run torchrun \
   --resume ./output_dir/ \
   --use_checkpoint \
   --data_path "$WORKDIR" \
-  --cached_path "$WORKDIR/cache_dir" \
+  --cached_path "$CACHE_DIR" \
   --use_cached \
   --use_sb \
   --sb_mode i2i \

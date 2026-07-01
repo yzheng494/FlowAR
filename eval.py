@@ -12,7 +12,9 @@ import util.misc as misc
 
 from models.vae import AutoencoderKL
 from models import flowar
-from engine import evaluate
+from engine import evaluate, evaluate_reconstruction
+from util.loader import CachedEvalFolder
+from torchvision import datasets, transforms
 
 
 
@@ -39,7 +41,7 @@ def get_args_parser():
                         help='number of tokens to group as a patch.')
 
     # Generation parameters
-    parser.add_argument('--num_steps', default=25, type=int,
+    parser.add_argument('--num_step', default=25, type=int,
                         help='number of autoregressive iterations to generate an image')
     parser.add_argument('--guidance', default=0.9, type=float,
                         help='number of autoregressive iterations to generate an image')
@@ -121,6 +123,14 @@ def get_args_parser():
     parser.set_defaults(use_cached=True)
     parser.add_argument('--cached_path', default='', help='path to cached latents')
 
+    # reconstruction evaluation on a validation set
+    parser.add_argument('--val_dir', default='', type=str,
+                        help='path to val images in ImageFolder layout (for reconstruction eval)')
+    parser.add_argument('--val_cached_path', default='', type=str,
+                        help='path to cached val latents (alternative to --val_dir)')
+    parser.add_argument('--val_eval_size', type=int, default=256,
+                        help='number of val images used for reconstruction metrics')
+
     return parser
 
 
@@ -180,6 +190,42 @@ def main(args):
     torch.cuda.empty_cache()
     evaluate(model_without_ddp, vae, args, 0, batch_size=args.eval_bsz, log_writer=log_writer,
                 cfg=args.cfg, use_ema=True)
+
+    # reconstruction evaluation (PSNR / SSIM / LPIPS)
+    if args.val_dir or args.val_cached_path:
+        if args.val_cached_path:
+            dataset_val = CachedEvalFolder(args.val_cached_path)
+            use_cached_val = True
+        else:
+            transform_val = transforms.Compose([
+                transforms.Resize(args.img_size),
+                transforms.CenterCrop(args.img_size),
+                transforms.ToTensor(),
+                transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
+            ])
+            dataset_val = datasets.ImageFolder(args.val_dir, transform=transform_val)
+            use_cached_val = False
+
+        rng = torch.Generator()
+        rng.manual_seed(args.seed)
+        indices = torch.randperm(len(dataset_val), generator=rng)[:args.val_eval_size].tolist()
+        subset_val = torch.utils.data.Subset(dataset_val, indices)
+        val_loader = torch.utils.data.DataLoader(
+            subset_val,
+            batch_size=min(16, args.val_eval_size),
+            num_workers=args.num_workers,
+            pin_memory=args.pin_mem,
+            drop_last=False,
+        )
+
+        recon_metrics = evaluate_reconstruction(
+            model_without_ddp, vae, val_loader, args, epoch=0,
+            num_samples=args.val_eval_size,
+            use_cached=use_cached_val,
+        )
+        print("Reconstruction metrics:")
+        for k, v in sorted(recon_metrics.items()):
+            print(f"  {k}: {v:.4f}")
 if __name__ == '__main__':
     args = get_args_parser()
     args = args.parse_args()

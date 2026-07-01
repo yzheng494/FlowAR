@@ -1,13 +1,14 @@
 #!/bin/bash
-#SBATCH -J flowar_sb_i2i_small_4gpu
+#SBATCH -J flowar_freeze_ar_small_4gpu
 #SBATCH --account=gts-bdai6
 #SBATCH -N 1
 #SBATCH --ntasks-per-node=4
 #SBATCH --cpus-per-task=8
 #SBATCH --mem-per-cpu=8G
 #SBATCH --gpus=A100:4
+#SBATCH -p gpu-a100
 #SBATCH -t 08:00:00
-#SBATCH -q embers
+#SBATCH -q inferno
 #SBATCH -o /storage/home/hcoda1/7/yzheng494/logs/slurm-%j.out
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --mail-user=yzheng494@gatech.edu
@@ -22,14 +23,14 @@ WORKDIR=/storage/scratch1/7/yzheng494/FlowAR
 CACHE_DIR=/storage/project/r-bdai6-0/yzheng494/FlowAR/cache_dir
 LOG_DIR=/storage/home/hcoda1/7/yzheng494/logs
 mkdir -p "$LOG_DIR"
-LOG_FILE="$LOG_DIR/train_i2i_small_x1_pred_4gpu_${SLURM_JOB_ID}.log"
+LOG_FILE="$LOG_DIR/train_freeze_ar_small_4gpu_${SLURM_JOB_ID}.log"
 
 cd "$WORKDIR"
 
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 uv run torchrun \
   --nproc_per_node=4 \
-  --master_port 7811 \
+  --master_port 7812 \
   main_flowar.py \
   --img_size 256 \
   --vae_path "$WORKDIR/mar/vae/kl16.ckpt" \
@@ -43,8 +44,8 @@ uv run torchrun \
   --warmup_epochs 100 \
   --batch_size 32 \
   --blr 5e-5 \
-  --output_dir ./output_dir/ \
-  --resume ./output_dir/ \
+  --output_dir ./output_dir_freeze_ar/ \
+  --resume ./output_dir_freeze_ar/ \
   --use_checkpoint \
   --data_path "$WORKDIR" \
   --cached_path "$CACHE_DIR" \
@@ -53,9 +54,11 @@ uv run torchrun \
   --sb_mode i2i \
   --sb_prediction x0 \
   --sb_beta_max 1.0 \
+  --freeze_ar \
+  --pretrained "$WORKDIR/model_dir/FlowAR-S.pth" \
   --online_eval \
   --eval_freq 1 \
-  --num_images 200 \
+  --num_images 1000 \
   --eval_bsz 16 \
   --val_eval_freq 1 \
   --num_workers 6 \

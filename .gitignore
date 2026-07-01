@@ -24,6 +24,7 @@ output_dir/
 logs/
 wandb/
 cache_dir/
+output_dir_freeze_ar/
 
 # Checkpoints and model weights
 *.pt

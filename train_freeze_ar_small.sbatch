@@ -1,11 +1,11 @@
 #!/bin/bash
-#SBATCH -J flowar_freeze_ar_small_4gpu
+#SBATCH -J flowar_freeze_ar_small
 #SBATCH --account=gts-bdai6
 #SBATCH -N 1
-#SBATCH --ntasks-per-node=4
+#SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem-per-cpu=8G
-#SBATCH --gpus=A100:4
+#SBATCH --gpus=A100:1
 #SBATCH -t 08:00:00
 #SBATCH -q embers
 #SBATCH -o /storage/home/hcoda1/7/yzheng494/logs/slurm-%j.out
@@ -19,16 +19,17 @@ echo "Node: $SLURMD_NODENAME"
 echo "Start: $(date)"
 
 WORKDIR=/storage/scratch1/7/yzheng494/FlowAR
+CACHE_DIR=/storage/project/r-bdai6-0/yzheng494/FlowAR/cache_dir
 LOG_DIR=/storage/home/hcoda1/7/yzheng494/logs
 mkdir -p "$LOG_DIR"
-LOG_FILE="$LOG_DIR/train_freeze_ar_small_4gpu_${SLURM_JOB_ID}.log"
+LOG_FILE="$LOG_DIR/train_freeze_ar_small_${SLURM_JOB_ID}.log"
 
 cd "$WORKDIR"
 
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 uv run torchrun \
-  --nproc_per_node=4 \
-  --master_port 7812 \
+  --nproc_per_node=1 \
+  --master_port 7811 \
   main_flowar.py \
   --img_size 256 \
   --vae_path "$WORKDIR/mar/vae/kl16.ckpt" \
@@ -46,7 +47,7 @@ uv run torchrun \
   --resume ./output_dir_freeze_ar/ \
   --use_checkpoint \
   --data_path "$WORKDIR" \
-  --cached_path "$WORKDIR/cache_dir" \
+  --cached_path "$CACHE_DIR" \
   --use_cached \
   --use_sb \
   --sb_mode i2i \
