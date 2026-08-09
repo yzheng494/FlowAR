@@ -189,13 +189,14 @@ def evaluate(model_without_ddp, vae, args, epoch, batch_size=16, log_writer=None
 
         labels_gen = class_label_gen_world[world_size * batch_size * i + local_rank * batch_size:
                                                 world_size * batch_size * i + (local_rank + 1) * batch_size]
+        
         labels_gen = torch.Tensor(labels_gen).long().cuda()
 
 
         torch.cuda.synchronize()
         start_time = time.time()
 
-        # generation
+        # generation step
         with torch.no_grad():
             with torch.cuda.amp.autocast():
                 sampled_tokens = model_without_ddp.sample_tokens(num_steps=args.num_step, guidance=args.guidance, cfg=cfg,labels=labels_gen,)
@@ -254,6 +255,7 @@ def evaluate(model_without_ddp, vae, args, epoch, batch_size=16, log_writer=None
         print("FID: {:.4f}, Inception Score: {:.4f}".format(fid, inception_score))
 
         # persist to the output directory so results survive without tensorboard/wandb
+        
         import json
         fid_metrics = {
             'fid{}'.format(postfix): fid,
@@ -307,8 +309,7 @@ def evaluate_reconstruction(model_without_ddp, vae, val_loader, args, epoch,
         The final output is compared to the GT image.
         Reports val/psnr_B and val/ssim_B.
 
-    Both yield meaningful PSNR/SSIM because the output and GT refer to the
-    same image.  Only executes on rank 0.
+    Only executes on rank 0.
     """
     if not misc.is_main_process():
         return {}
