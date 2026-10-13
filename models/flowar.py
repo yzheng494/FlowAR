@@ -715,6 +715,8 @@ class FlowAR(nn.Module):
 
 
 def flowar_small(**kwargs):
+    # Let flow tokens attend to the AR context, as in the larger variants.
+    kwargs.setdefault('cross', True)
     model = FlowAR(
         encoder_embed_dim=768, encoder_depth=6, encoder_num_heads=12,
         decoder_embed_dim=768, decoder_depth=6, decoder_num_heads=12,

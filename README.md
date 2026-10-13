@@ -58,7 +58,9 @@ main_flowar.py \
 ```
 If you face "NaN", please disable mixed precision and use only TF32. We will also release a more stable version soon :)
 
-For smaller models, we retain the Attn-MLP as described in the paper, while for larger models, we adopt the Attn-CrossAttn-MLP architecture. Both architectures achieve similar performance under the same parameters.
+This checkout uses the Attn-CrossAttn-MLP flow network for small, large, and huge models. In each cross-attention block, flow tokens query the AR decoder context `z`. Small models can use the original Attn-MLP architecture when constructed in Python with `cross=False`. Time-only flow networks still ignore AR context and do not use cross-attention.
+
+Small-model checkpoints trained with the original Attn-MLP flow network are not directly compatible with the new default flow network. For frozen-AR experiments, `--pretrained` can load the AR weights with the existing non-strict loader, but the changed flow blocks need training; use a fresh output/resume directory rather than resuming an old optimizer checkpoint.
 
 ## Inference
 The pretrained weights are available at [huggingface🤗](https://huggingface.co/OliverRen/FlowAR)
